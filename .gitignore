@@ -1,0 +1,26 @@
+# Sensitive info
+.env
+
+# Databases
+*.db
+*.sqlite3
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Generated reports / data outputs
+batch_report.csv
+batch_exceptions.csv
+
+# IDEs
+.vscode/
+.idea/

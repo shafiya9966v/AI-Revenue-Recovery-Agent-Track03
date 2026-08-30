@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>AI Revenue Recovery — Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #0b0f14; color: #e6edf3; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; margin-bottom: 24px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
+  .card .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 28px; font-weight: 600; margin-top: 6px; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  canvas { max-height: 320px; }
+  #status { color: #8b949e; font-size: 12px; margin-top: 24px; }
+  .green { color: #3fb950; }
+  .amber { color: #d29922; }
+</style>
+</head>
+<body>
+  <h1>AI Revenue Recovery — Audit Dashboard</h1>
+  <div class="subtitle">Live metrics from the FastAPI backend (<code>/metrics</code>). Run <code>uvicorn app.main:app</code> then open this file.</div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Events Processed</div><div class="value" id="m-events">–</div></div>
+    <div class="card"><div class="label">Amount At Risk</div><div class="value" id="m-atrisk">–</div></div>
+    <div class="card"><div class="label">Amount Recovered</div><div class="value green" id="m-recovered">–</div></div>
+    <div class="card"><div class="label">Recovery Rate</div><div class="value" id="m-rate">–</div></div>
+  </div>
+
+  <div class="charts">
+    <div class="card">
+      <div class="label">Root Cause Breakdown</div>
+      <canvas id="rootCauseChart"></canvas>
+    </div>
+    <div class="card">
+      <div class="label">Action Breakdown</div>
+      <canvas id="actionChart"></canvas>
+    </div>
+  </div>
+
+  <div id="status">Not connected yet — fetching from http://localhost:8000/metrics ...</div>
+
+<script>
+const API_BASE = "http://localhost:8000";
+
+async function load() {
+  try {
+    const res = await fetch(`${API_BASE}/metrics`);
+    const m = await res.json();
+
+    document.getElementById("m-events").textContent = m.total_events_processed;
+    document.getElementById("m-atrisk").textContent = "₹" + m.total_amount_at_risk_inr.toLocaleString("en-IN");
+    document.getElementById("m-recovered").textContent = "₹" + m.total_amount_recovered_inr.toLocaleString("en-IN");
+    document.getElementById("m-rate").textContent = m.recovery_rate_pct + "%";
+    document.getElementById("status").textContent = "Connected — last updated " + new Date().toLocaleTimeString();
+    document.getElementById("status").className = "";
+
+    renderChart("rootCauseChart", m.root_cause_breakdown, "#58a6ff");
+    renderChart("actionChart", m.action_breakdown, "#3fb950");
+  } catch (e) {
+    document.getElementById("status").textContent = "Could not reach API at " + API_BASE + " — start the FastAPI server first.";
+    document.getElementById("status").className = "amber";
+  }
+}
+
+let charts = {};
+function renderChart(canvasId, dataObj, color) {
+  const labels = Object.keys(dataObj || {});
+  const values = Object.values(dataObj || {});
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  if (charts[canvasId]) charts[canvasId].destroy();
+  charts[canvasId] = new Chart(ctx, {
+    type: "bar",
+    data: { labels, datasets: [{ data: values, backgroundColor: color }] },
+    options: {
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: "#8b949e" }, grid: { color: "#30363d" } },
+        y: { ticks: { color: "#8b949e" }, grid: { color: "#30363d" } }
+      }
+    }
+  });
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
