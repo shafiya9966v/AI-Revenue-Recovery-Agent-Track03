@@ -21,6 +21,36 @@ failed, then pick the intervention that actually fits that cause.
 ```
 DETECT → DIAGNOSE (ML) → DECIDE (policy engine) → ACT (Razorpay) → AUDIT
 ```
+## 5. Architecture
+
+```
+                    EVENT SOURCE
+        Razorpay test-mode webhook: payment.failed
+                        |
+                        v
+        DETECT  (app/detect.py) — deterministic
+   Deduplicates events, drops already-stopped payments
+                        |
+                        v
+        DIAGNOSE  (app/diagnose.py) — ML
+     RandomForest -> root_cause + confidence score
+                        |
+                        v
+        DECIDE  (app/decide.py) — deterministic policy engine
+      5 hard gates -> action + human-readable reason string
+                        |
+                        v
+        ACT  (app/act.py) — deterministic execution
+   Razorpay test-mode API (or simulation fallback)
+   Wrapped in try/except — one gateway failure handled cleanly
+        -> NUDGE (app/nudge.py) — the one LLM call, Hinglish messaging
+                        |
+                        v
+        AUDIT  (app/audit.py) — every stage logs here
+        Queryable via GET /audit/{payment_id}
+```
+
+---
 | Stage | File | ML or rules? |
 |---|---|---|
 | Detect | `app/detect.py` | Rules — dedup + stopped-payment filter |
