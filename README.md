@@ -1,26 +1,119 @@
-# AI Revenue Recovery — Payment Degradation → Root Cause → Recovery Action
+# AI Revenue Recovery Agent
+### Track 03 — Payment Degradation → Root Cause → Recovery Action
 
-An agent that detects failed payments, diagnoses *why* they failed, decides
-the right recovery action under hard safety gates, executes it against
-Razorpay's test-mode APIs, and logs every step to a queryable audit trail.
-
-Built for Track 03 (AI Revenue Recovery).
+An agent that detects revenue at risk from failed payments, diagnoses *why*
+each payment failed, decides the right recovery intervention under hard
+safety gates, executes it against Razorpay's test-mode APIs, and logs every
+decision to a queryable audit trail.
 
 ---
 
-## The problem
+## 1. Problem Statement
 
-Merchants lose revenue in failed payments, and most systems respond with
-blind blanket retries — expensive, annoying to customers, and useless when
-the failure isn't actually recoverable (fraud, a truly dead payment). The
-missing piece is **diagnosis before action**: understand *why* a payment
-failed, then pick the intervention that actually fits that cause.
+Revenue loss from failed payments rarely happens in one clean step, and most
+systems respond to it in one of two bad ways:
 
-## Pipeline
+- **Ignore it** — the payment fails, nothing happens, the revenue is gone.
+- **Blindly retry everything** — expensive in gateway fees, annoying to
+  customers, and actively dangerous when the failure is fraud (you do not
+  want to keep re-attempting a charge on a fraudulent card).
+
+The piece missing from both approaches is **diagnosis before action**. A
+payment that failed because of a temporary bank timeout needs a completely
+different response than one that failed because a card expired, or one that
+is actually fraud. This project builds that missing diagnosis-and-decision
+layer.
+
+---
+
+## 2. Solution Approach
+
+The system is built as a five-stage pipeline, not a single monolithic
+"AI agent":
 
 ```
 DETECT → DIAGNOSE (ML) → DECIDE (policy engine) → ACT (Razorpay) → AUDIT
 ```
+
+**The central design decision:** only the Diagnose stage uses machine
+learning. Detection, policy decisions, and action execution are all plain,
+deterministic code. Money-safety guarantees — never exceed a retry cap,
+never auto-retry a fraud case, always escalate low-confidence diagnoses —
+should not depend on a model being right. They are enforced by code that
+cannot be talked out of it.
+
+The one exception, deliberately scoped, is a small LLM-powered customer
+messaging feature (see Section 7) — because natural language generation is
+exactly the kind of low-stakes, creative task an LLM is suited for, and
+nowhere near a financial decision.
+
+---
+
+## 3. Root-Cause Taxonomy
+
+| Root Cause | Recoverable? | Default Action |
+|---|---|---|
+| insufficient_funds | Yes | Delayed retry |
+| bank_side_transient | Yes | Fast retry |
+| card_expired | Yes | Request new payment instrument |
+| customer_abandoned | Yes | Notify / reminder |
+| mandate_failed | Yes | Mandate retry sequence |
+| gateway_issue | Yes | Single immediate retry |
+| fraud_suspected | No | Always escalate to human, never auto-retried |
+| unrecoverable | No | Write off, log only |
+
+Eight causes, chosen to be fine-grained enough to map to distinct actions,
+and coarse enough for a classifier to learn reliably from a few hundred
+labeled examples. Two of the eight (fraud_suspected, unrecoverable) are
+deliberately "dead ends" for automation — this is where the system is
+designed to know when to stop, not just how to act.
+
+---
+
+## 4. Methodology
+
+### 4.1 Data
+
+No public dataset exists with labeled "why did this payment fail" data, so
+a synthetic generator (data/generate_synthetic_data.py) produces it,
+calibrated to realistic Indian digital-payments failure patterns:
+transient bank/UPI errors and insufficient funds dominate (about 20% each);
+fraud is rare but high-severity (about 5%). Roughly 6% label noise is
+injected deliberately so the classifier cannot simply memorize a 1:1
+error-code lookup — it has to learn genuine signal from overlapping,
+ambiguous cases, the same way real payment data would behave.
+
+### 4.2 Model
+
+A RandomForestClassifier (scikit-learn) predicts root cause from six
+features: amount, instrument type, error code, attempt number, time since
+last attempt, and customer payment history. Chosen deliberately over a
+heavier model (XGBoost, deep learning) because:
+
+- It is interpretable via feature_importances_ — a direct explainability
+  requirement.
+- It trains in seconds on a dataset this size — no need for a bigger tool
+  than the data warrants.
+- This is itself a judgment call worth stating: the right-sized model for
+  the data you actually have, not the most sophisticated one available.
+
+### 4.3 Policy Engine
+
+A hand-written policy table (app/config.py) maps each root cause to an
+action, a max-attempt cap, and a cooldown period. app/decide.py applies
+five hard gates, in order, before any action fires:
+
+1. Diagnosis confidence below 0.6 -> escalate to human, do not guess.
+2. fraud_suspected -> always escalate, regardless of confidence.
+3. unrecoverable -> write off, no action.
+4. Payment already at its max-attempts cap -> stop, escalate.
+5. Amount above Rs.50,000 -> require human approval before any action executes.
+
+These are asserted directly with automated tests
+(tests/test_policy_engine.py), not just described — see Section 9.
+
+---
+
 ## 5. Architecture
 
 ```
@@ -51,192 +144,185 @@ DETECT → DIAGNOSE (ML) → DECIDE (policy engine) → ACT (Razorpay) → AUDIT
 ```
 
 ---
-| Stage | File | ML or rules? |
-|---|---|---|
-| Detect | `app/detect.py` | Rules — dedup + stopped-payment filter |
-| Diagnose | `app/diagnose.py` | **ML** — RandomForest root-cause classifier |
-| Decide | `app/decide.py` | Rules — hard safety gates, no ML |
-| Act | `app/act.py` | Deterministic execution (Razorpay SDK or simulation) |
-| Audit | `app/audit.py` | Every stage writes here |
-**Deliberate design choice:** only the Diagnosis stage uses ML. Detection,
-policy decisions, and action execution are all plain deterministic code.
-A merchant's money-safety guarantees (never exceed retry caps, never
-auto-retry fraud, always escalate low-confidence cases) should not depend
-on a model being right — they're enforced by code that can't be talked out
-of it.
 
----
-
-## Directory structure
+## 6. Directory Structure
 
 ```
 revenue-recovery-agent/
 ├── README.md
 ├── requirements.txt
 ├── .env.example
+├── test_nudge.py                    # standalone LLM integration check
 ├── data/
-│   ├── generate_synthetic_data.py   # synthetic dataset generator
-│   └── payment_failures.csv         # generated on first run
+│   ├── generate_synthetic_data.py
+│   └── payment_failures.csv
 ├── ml/
-│   ├── train_classifier.py          # trains + evaluates the root-cause model
-│   ├── root_cause_model.joblib       # generated
-│   └── feature_encoders.joblib       # generated
+│   ├── train_classifier.py
+│   ├── root_cause_model.joblib
+│   └── feature_encoders.joblib
 ├── app/
-│   ├── main.py                      # FastAPI app: webhook, metrics, audit endpoints
-│   ├── schemas.py                   # Pydantic contracts for every pipeline stage
-│   ├── config.py                    # policy table + thresholds, env-driven
-│   ├── database.py / models.py      # SQLAlchemy engine + ORM tables
-│   ├── detect.py                    # detection layer
-│   ├── diagnose.py                  # ML diagnosis layer
-│   ├── decide.py                    # policy engine — the hard gates
-│   ├── act.py                       # Razorpay execution layer
-│   └── audit.py                     # audit trail writer
+│   ├── main.py            # FastAPI app — webhook, metrics, audit endpoints
+│   ├── schemas.py          # Pydantic contracts for every pipeline stage
+│   ├── config.py           # policy table + thresholds
+│   ├── database.py / models.py
+│   ├── detect.py
+│   ├── diagnose.py
+│   ├── decide.py           # the policy engine — hard gates
+│   ├── act.py              # Razorpay execution + nudge trigger
+│   ├── nudge.py             # Hinglish LLM messaging — the one LLM call
+│   └── audit.py
 ├── tests/
-│   └── test_policy_engine.py        # pytest — safety-gate assertions
+│   └── test_policy_engine.py
 ├── scripts/
-│   └── run_batch.py                 # runs the full pipeline on a held-out batch
+│   └── run_batch.py
 ├── dashboard/
-│   └── index.html                   # Chart.js dashboard reading /metrics
-└── batch_report.csv / batch_exceptions.csv   # generated by run_batch.py
+│   └── index.html
+└── batch_report.csv / batch_exceptions.csv
 ```
 
 ---
-## Root-cause taxonomy
 
-| Root Cause | Recoverable? | Default Action |
+## 7. AI Judgment — where AI is used, and where it deliberately is not
+
+| Task | Tool used | Why |
 |---|---|---|
-| `insufficient_funds` | Yes | Delayed retry |
-| `bank_side_transient` | Yes | Fast retry |
-| `card_expired` | Yes | Request new instrument |
-| `customer_abandoned` | Yes | Notify/reminder |
-| `mandate_failed` | Yes | Mandate retry sequence |
-| `gateway_issue` | Yes | Single immediate retry |
-| `fraud_suspected` | **No** | **Always escalate to human — never auto-retried** |
-| `unrecoverable` | No | Write off, log only |
-## Hard gates (enforced in `app/decide.py`, not by the model)
+| Root-cause diagnosis | ML (RandomForest) | Genuine pattern-recognition problem — no fixed rule can separate 8 overlapping failure classes reliably |
+| Retry caps, fraud escalation, approval gates | Deterministic code | Money-safety guarantees must be reproducible and cannot depend on a model being right every time |
+| Action execution (API calls) | Deterministic code | Execution is a mechanical step — no judgment needed, only correctness |
+| Customer recovery messaging | LLM (Mistral) | Low-stakes, creative natural-language task — exactly what an LLM is suited for, and nowhere near a financial decision |
+| Policy orchestration | Plain Python, no agent framework | The decision logic is a lookup table with gates — using a heavy agent framework here would add complexity without adding capability |
 
-1. Never exceed the per-cause max-attempts cap.
-2. `fraud_suspected` is never auto-actioned, regardless of confidence.
-3. Diagnosis confidence < 0.6 → escalate to human review instead of guessing.
-4. Amount > ₹50,000 → requires human approval before any action fires.
-5. Idempotency: duplicate events and already-stopped payments are dropped at
-   the Detect layer.
+The single LLM touchpoint (app/nudge.py) generates short Hinglish recovery
+messages for customer-facing actions only (notify_customer,
+request_new_instrument, mandate_retry_sequence). It runs in a deterministic
+template-fallback mode when no API key is configured, and falls back to the
+same templates if a live API call fails — so a language model outage never
+breaks the recovery workflow, only slightly degrades the message quality.
 
 ---
 
-## How to run
+## 8. Failure Recovery — what broke, and what was done about it
 
-```bash
-pip install -r requirements.txt --break-system-packages
-cp .env.example .env   # optional — leave Razorpay keys blank to run in SIMULATION mode
+**1. Classifier weak spot, disclosed not hidden.**
+The gateway_issue class has the weakest F1-score (about 0.54) among the 8
+root causes, because it overlaps heavily with bank_side_transient in
+feature space — both often present as generic processing errors. Rather
+than hide this, the confidence gate in app/decide.py catches it directly:
+any diagnosis below 0.6 confidence is routed to human escalation instead of
+being auto-actioned. The weakness in the model does not propagate into a
+bad automated decision.
 
-# 1. Generate synthetic data
-python data/generate_synthetic_data.py
+**2. Live API failure, handled gracefully.**
+app/act.py wraps every live Razorpay execution call in a try/except. If the
+call raises — timeout, malformed response, rate limit — the pipeline does
+not crash or leave a payment in an inconsistent state. It logs the
+exception to the audit trail (result: exception_handled_gracefully), marks
+the attempt as outcome: failed (visible in metrics, not silently dropped),
+and the same max-attempts cap still applies to any subsequent retry.
 
-# 2. Train + evaluate the classifier
-python ml/train_classifier.py
+**3. LLM output not matching the required register (caught during testing).**
+An early version of the Hinglish nudge prompt produced plain English output
+instead of genuine Hindi-English code-switching. This was caught by running
+the diagnostic script (test_nudge.py) and comparing outputs across repeated
+calls — the fix was a stronger, example-anchored prompt. This is included
+here as a real instance of iterating on a failure during development, not a
+theoretical failure mode.
 
-# 3. Run the safety-gate tests
-pytest tests/ -v
+---
 
-# 4. Run the full pipeline on a held-out batch and get the metrics report
-python scripts/run_batch.py
+## 9. Automated Tests
 
-# 5. Start the API
-uvicorn app.main:app --reload
+tests/test_policy_engine.py — 5 tests targeted specifically at the
+money-safety-critical gates, not full code coverage:
 
-# 6. Open dashboard/index.html in a browser (with the API running)
+```
+test_fraud_never_auto_retried                       PASSED
+test_low_confidence_escalates_regardless_of_cause    PASSED
+test_high_value_requires_approval                    PASSED
+test_max_attempts_enforced                           PASSED
+test_unrecoverable_never_actioned                    PASSED
 ```
 
-Without Razorpay test-mode keys in `.env`, `app/act.py` automatically runs in
-**SIMULATION mode** — deterministic, seeded outcomes — so the entire pipeline
-is runnable and demoable without live credentials. Add real test-mode keys to
-switch to actual Razorpay Payment Links API calls.
+Each test calls the real decide() function against a fresh in-memory
+database, not a mock — these assertions verify actual pipeline behavior.
 
 ---
 
-## Results (held-out batch of 60 synthetic events, not used in classifier training/eval split)
+## 10. Results (held-out batch of 60 synthetic events)
 
 ```
 Root-cause diagnosis accuracy:      54/60  (90.0%)
 Fraud correctly escalated:          7/7    (100.0%)
-Total amount at risk:               ₹528,912.90
-Total amount recovered:             ₹104,942.79
+Total amount at risk:               Rs.528,912.90
+Total amount recovered:             Rs.104,942.79
 Recovery rate (of at-risk value):   19.8%
-False-positive actions (cost):      0  (no action taken on unrecoverable/fraud ground truth)
+False-positive actions (cost):      0
 Exceptions logged:                  16
 ```
 
-Full per-record results: `batch_report.csv`. Exception list: `batch_exceptions.csv`.
+Classifier held-out test-split accuracy (separate from the batch run,
+ml/train_classifier.py): 83% across all 8 classes, with near-perfect
+precision/recall on fraud_suspected and insufficient_funds.
 
-**On the numbers:** the classifier's held-out test-split accuracy (from
-`ml/train_classifier.py`) is 83% across all 8 classes, with perfect precision/recall
-on `fraud_suspected` and `insufficient_funds`, and weaker performance on
-`gateway_issue` (F1 0.54) — the class with the most feature overlap with
-`bank_side_transient` by design. This is disclosed, not hidden: `gateway_issue`
-misclassification only ever routes to a retry action similar to what the true
-cause would have received, so the safety-relevant classes (fraud, unrecoverable)
-are the ones held to a near-perfect bar, and they are.
+**On synthetic data:** this dataset is generated, not real merchant data —
+no such labeled dataset is publicly available. These metrics demonstrate
+the pipeline's correctness and the model's ability to learn genuine signal
+from realistic, noisy data — not production-grade real-world accuracy,
+which would require validation against actual merchant failure logs.
 
-**19.8% recovery rate is a floor, not a ceiling** — it reflects conservative
-simulated success rates per action type (see `SIMULATED_SUCCESS_RATE` in
-`app/act.py`) chosen to avoid overstating results, not an optimistic guess.
-
----
-
-## On synthetic data
-
-This dataset is generated (`data/generate_synthetic_data.py`), not real
-merchant data — no such labeled root-cause dataset is publicly available.
-Class distributions are loosely informed by known patterns in Indian digital
-payments (transient bank/UPI failures and insufficient funds dominate; fraud
-is rare but high-severity), and ~6% label noise is injected deliberately so
-the classifier can't just memorize a 1:1 error-code lookup. These metrics
-demonstrate the pipeline's correctness and the model's ability to learn a
-real signal — not production-grade real-world accuracy, which would require
-validation against actual merchant failure logs.
+**On the 19.8% recovery rate:** this is a conservative floor, not an
+optimistic estimate — it reflects deliberately modest simulated
+success-rates per action type (see SIMULATED_SUCCESS_RATE in app/act.py),
+chosen to avoid overstating results.
 
 ---
 
-## The one failure, handled gracefully
+## 11. How to Run
 
-`app/act.py` wraps every live execution call in a try/except. If the
-Razorpay API call raises (timeout, malformed response, etc.), the pipeline:
-1. Does **not** crash or leave the payment in an inconsistent state.
-2. Logs the exception to the audit trail with `result: exception_handled_gracefully`.
-3. Marks the attempt as `outcome: failed` (not silently dropped) so it's
-   visible in the metrics and can be picked up by the next retry cycle,
-   still bounded by the same max-attempts cap.
+```bash
+pip install -r requirements.txt --break-system-packages
+cp .env.example .env   # optional — blank keys run everything in simulation mode
 
-This was exercised directly in the SIMULATION-mode batch run, and the same
-try/except path applies unchanged when live Razorpay keys are configured.
+python data/generate_synthetic_data.py     # generate synthetic dataset
+python ml/train_classifier.py               # train + evaluate the classifier
+pytest tests/ -v                             # run the safety-gate tests
+python scripts/run_batch.py                  # run the full pipeline, get metrics
+python test_nudge.py                          # verify the LLM nudge integration
+uvicorn app.main:app --reload                  # start the API
+```
+
+Then open dashboard/index.html in a browser (with the API running) for the
+visual metrics dashboard, or http://localhost:8000/docs for the interactive
+Swagger UI to trigger the pipeline live.
+
+Without Razorpay or Mistral API keys in .env, both the Act layer and the
+Nudge layer automatically run in deterministic simulation/fallback mode —
+the entire pipeline is fully runnable and demoable without any live
+credentials.
 
 ---
 
-## Explainability
+## 12. Tech Stack Summary
 
-Every `Decision` carries a human-readable `reason` string built from the
-diagnosis and the gate that fired, e.g.:
-
-```
-root_cause=bank_side_transient | confidence=0.93 | action=retry_fast | attempt 1/3 | standard auto-execution
-```
-
-or, when a gate blocks automation:
-
-```
-root_cause=fraud_suspected | confidence=0.95 | fraud_suspected -> hard rule: always escalate, never auto-retry
-```
-
-Full audit trail for any payment: `GET /audit/{payment_id}`.
+| Tool | Purpose |
+|---|---|
+| FastAPI + Pydantic | Pipeline orchestration, strict schema validation at every stage boundary |
+| scikit-learn RandomForestClassifier | Root-cause diagnosis — interpretable, fast, right-sized for the data |
+| SQLAlchemy + SQLite | Structured, queryable audit trail |
+| Razorpay Python SDK | Test-mode Payment Links API, with simulation fallback |
+| Mistral API | The one LLM touchpoint — Hinglish customer messaging, with template fallback |
+| pytest | Targeted tests on the money-safety-critical policy gates |
+| Chart.js (vanilla HTML) | Lightweight metrics dashboard, no build step |
 
 ---
 
-## Tech stack summary
+## 13. What's Next (beyond hackathon scope)
 
-- **FastAPI + Pydantic** — pipeline orchestration and strict schema validation at every stage boundary
-- **scikit-learn RandomForestClassifier** — root-cause diagnosis (interpretable via `feature_importances_`, fast to train/iterate on a few hundred rows)
-- **SQLAlchemy + SQLite** — structured, queryable audit trail (not flat logs)
-- **Razorpay Python SDK** — test-mode Payment Links API for real recovery actions, with automatic simulation fallback
-- **pytest** — targeted tests on the money-safety-critical policy gates
-- **Chart.js (vanilla HTML)** — lightweight dashboard, no build step needed
+- Regional-language expansion beyond Hinglish (Telugu, Tamil, etc. — tested
+  informally and the underlying model handles this well already)
+- A learned recovery-probability scorer replacing the fixed simulated
+  success rates in app/act.py
+- NPCI-compliant mandate-retry spacing rules for mandate_failed cases
+- A human-approval queue UI for high-value and low-confidence escalations
+- Validation against real (anonymized) merchant failure logs, not synthetic
+  data
